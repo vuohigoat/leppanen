@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+import sys
+import re
+import subprocess as sp
+from urllib.request import urlopen, urlretrieve
+from functions import *
+
+deb_kernel_url="https://nightly.link/chrultrabook/debian-kernel/workflows/build/main/debian-kernel.zip"
+
+# parse arguments from the cli. Only for testing/advanced use.
+def process_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-b", dest="board_name", type=str, nargs=1, default=[""],
+                        help="Override board name.")
+    parser.add_argument("--enable-debug", action='store_const', const="Enabling", dest="debug",
+                        help="Enable audio debugging.")
+    parser.add_argument("--disable-debug", action='store_const', const="Disabling", dest="debug",
+                        help="Disable audio debugging.")
+    parser.add_argument("--force-avs-install", action="store_true", dest="force_avs_install", default=False,
+                        help="DANGEROUS: Force enable AVS install. MIGHT CAUSE PERMANENT DAMAGE TO SPEAKERS!")
+    parser.add_argument("--branch", dest="branch_name", type=str, nargs=1, default=["standalone"],
+                        help="Use a different branch when cloning ucm. FOR DEVS AND TESTERS ONLY!")
+    return parser.parse_args()
+
+
+def install_ucm():
+    print_status("Installing UCM configuration")
+    try:
+        bash("rm -rf /tmp/alsa-ucm-conf-cros")
+        bash(f"git clone https://github.com/WeirdTreeThing/alsa-ucm-conf-cros -b {args.branch_name[0]} /tmp/alsa-ucm-conf-cros")
+    except:
+        print_error("Error: Failed to clone UCM repo")
+        exit(1)
+
+    cpdir("/tmp/alsa-ucm-conf-cros/ucm2", "/usr/share/alsa/ucm2/")
+    cpdir("/tmp/alsa-ucm-conf-cros/overrides", "/usr/share/alsa/ucm2/conf.d")
+
+
+def ubuntu():
+    print_error("WARNING: UBUNTU IS *NOT* SUPPORTED")
+    print_error("Ubuntu has too many issues that I don't feel like fixing")
+    print_error("If you open an issue on Github and you are running Ubuntu, I will close it right away.")
+    print_error("If you are an Ubuntu user, too bad so sad. Find another audio script.")
+    print_error("Despite not being supported, the script will still try to get audio working on Ubuntu. If it works for you, great. If it doesn't, that's too bad.")
+    #exit()
+
+
+def install_deb_kernel():
+    print_status("Updating linux kernel (this may take some time)")
+    try:
+        urlretrieve(url=deb_kernel_url, filename="/tmp/debian-kernel.zip")
+        bash("cd /tmp && unzip debian-kernel.zip")
+        bash("apt install -y /tmp/linux-image-*-chrultrabook_*_amd64.deb")
+        bash("rm /tmp/debian-kernel.zip /tmp/linux-*.deb")
+        print_status("Kernel installed")
+    except:
+        print_error("Error: Failed to install kernel")
+
+
+def get_board():
+    if not args.board_name[0]:
+        # x86: Get the board name from dmi
+        if path_exists("/sys/devices/virtual/dmi/id/"):
+            with open("/sys/devices/virtual/dmi/id/product_name", "r") as dmi:
+                device_board = dmi.read()
+        # arm: Get board name from CrOS HWID
+        if path_exists("/sys/firmware/devicetree/base/"):
+            with open("/sys/firmware/devicetree/base/firmware/chromeos/hardware-id", "r") as hwid:
+                device_board = hwid.read().split(" ")[0].split("-")[0]
+    else:  # use the board name from the args, for testing only
+        device_board = str(args.board_name[0])
+        print_warning(f"Board name override: {device_board}")
+    return device_board.lower().strip()
+
+
+def match_platform(device_board):
+    with open("conf/boards.json", "r") as file:
+        boards = json.load(file)
+
+    try:
+        match boards[device_board]:
+            case "bdw" | "byt" | "bsw":
+                hifi2_audio()
+            case "skl" | "kbl":
+                avs_audio()
+            case "apl":
+                apl_audio()
+            case "glk" | "cml" | "jsl" | "tgl" | "adl":
+                sof_audio(boards[device_board])
+            case "stoney" | "picasso" | "cezanne" | "mendocino":
+                amd_audio(boards[device_board])
+            case "mt8183":
+                # mt8183 only needs ucm, so just pass to make the check happy
+                pass
+            case _:
+                print_error(f"Unknown/Unsupported chromebook model: {device_board}")
+                exit(1)
+    except KeyError:
+        print_error(f"Unknown/Unsupported chromebook model: {device_board}")
+        exit(1)
+
+
+def avs_audio():
+    if args.debug:
+        print_status(f"{args.debug} AVS debugging")
+        if args.debug == "Enabling":
+            cpfile("conf/avs/snd-avs-dbg.conf", "/etc/modprobe.d/snd-avs-dbg.conf")
+        else:
+            rmfile("/etc/modprobe.d/snd-avs-dbg.conf")
+        print_status("Done, please reboot for changes to take effect.")
+        exit()
+
+    print_status("Installing AVS")
+    # Only show the warning to devices with max98357a
+    override_avs = False
+    if path_exists("/sys/bus/acpi/devices/MX98357A:00"):
+        if args.force_avs_install:
+            print_error(
+                "WARNING: Your device has max98357a and can cause permanent damage to your speakers if you set the volume too loud!")
+            while input('Type "I understand the risk of permanently damaging my speakers" in all caps to continue: ')\
+            != "I UNDERSTAND THE RISK OF PERMANENTLY DAMAGING MY SPEAKERS":
+                print_error("Try again")
+            override_avs = True
+        else:
+            print_error(
+                "WARNING: Your device has max98357a and can cause permanent damage to your speakers if you "
+                "set the volume too loud! As a safety precaution devices with max98357a have speakers "
+                "disabled until a fix is in place. Headphones and HDMI audio are safe from this.")
+            print_question("If you want to disable this check, restart the script with --force-avs-install")
+
+            while input('Type "I Understand my speakers will not work since my device has max98357a!" in all caps to continue: ')\
+            != "I UNDERSTAND MY SPEAKERS WILL NOT WORK SINCE MY DEVICE HAS MAX98357A!":
+                print_error("Try again")
+            override_avs = False
+
+    # avs tplg is from https://github.com/thesofproject/avs-topology-xml, but isn't packaged in distros yet
+    print_status("Installing topology")
+    mkdir("/tmp/avs_tplg")
+    avs_tplg_ver = "2024.02"
+    bash(f"tar xf ./blobs/avs-topology_{avs_tplg_ver}.tar.gz -C /tmp/avs_tplg")
+    mkdir("/lib/firmware/intel/avs", create_parents=True)
+    cpdir("/tmp/avs_tplg/avs-topology/lib/firmware/intel/avs", "/lib/firmware/intel/avs")
+
+    # Force AVS driver since the kernel will use the SKL driver by default
+    print_status("Installing modprobe config")
+    cpfile("conf/avs/snd-avs.conf", "/etc/modprobe.d/snd-avs.conf")
+
+    # Install wireplumber config for dmic if wireplumber is installed on the system
+    if path_exists("/usr/bin/wireplumber"):
+        print_status("Forcing avs_dmic to use S16LE format")
+      # This is needed since newer wireplumber versions 0.5+ use a different configuration format
+        if "0.4" in sp.check_output("wireplumber -v", shell=True, text=True).strip():
+            mkdir("/etc/wireplumber/main.lua.d/", create_parents=True)
+            cpfile("conf/avs/51-avs-dmic.lua", "/etc/wireplumber/main.lua.d/51-avs-dmic.lua")
+        else:
+            mkdir("/etc/wireplumber/wireplumber.conf.d/", create_parents=True)
+            cpfile("conf/avs/51-avs-dmic.conf", "/etc/wireplumber/wireplumber.conf.d/51-avs-dmic.conf")
+
+    # updated avs dsp firmware recently got merged upstream but is not packaged in any distro yet
+    print_status("Installing AVS firmware")
+    mkdir("/lib/firmware/intel/avs/skl")
+    mkdir("/lib/firmware/intel/avs/apl")
+    try:
+        urlretrieve("https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/intel/avs/apl/"
+                "dsp_basefw.bin", filename="/lib/firmware/intel/avs/apl/dsp_basefw.bin")
+        urlretrieve("https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/intel/avs/skl/"
+                "dsp_basefw.bin", filename="/lib/firmware/intel/avs/skl/dsp_basefw.bin")
+    except:
+        print_error("Error: Failed to download AVS firmware")
+
+    # Delete topology for max98357a to prevent it from working until there is a volume limiter.
+    if not override_avs:
+        rmfile("/lib/firmware/intel/avs/max98357a-tplg.bin")
+
+    # Check for kernels with avs module enabled
+    kernels_installed = sp.check_output("ls /lib/modules/", shell=True, text=True).strip().split('\n')
+    has_avs = False
+    for kernel_version in kernels_installed:
+        if path_exists(f"/lib/modules/{kernel_version}/kernel/sound/soc/intel/avs"):\
+            has_avs = True
+
+    if not has_avs:
+        print_error("Looks like your kernel doesn't have the avs modules. Make sure you are on at least 6.4 with avs enabled")
+        exit(0)
+
+
+def apl_audio():
+    print_status("Apollolake has two audio drivers:")
+    print_status("SOF: Stable but doesn't work with headphones.")
+    print_status("AVS: Unstable and can cause damage to speakers but supports all audio hardware.")
+    print_error("NOTE: Speakers are disabled on AVS as a safety precaution. (use --force-avs-install to override)"
+                "Your speakers will still work on SOF though.")
+
+    while True:
+        user_input = input("Which driver would you like to use? [sof/avs]: ")
+        if user_input.lower() == "sof":
+            print_status("Using sof")
+            # Remove avs modprobe config if it exists
+            rmfile("/etc/modprobe.d/snd-avs.conf")
+            sof_audio("apl")
+            # Install apl specific modprobe config
+            cpfile("conf/sof/apl-sof.conf", "/etc/modprobe.d/apl-sof.conf")
+            break
+        elif user_input.lower() == "avs":
+            print_status("Using avs")
+            # Remove sof modprobe config if it exists
+            rmfile("/etc/modprobe.d/snd-sof.conf")
+            rmfile("/etc/modprobe.d/apl-sof.conf")
+            avs_audio()
+            break
+        else:
+            print_error(f"Invalid option: {user_input}")
+            continue
+
+
+def sof_audio(platform):
+    if args.debug:
+        print_status(f"{args.debug} SOF debugging")
+        if args.debug == "Enabling":
+            cpfile("conf/sof/snd-sof-dbg.conf", "/etc/modprobe.d/snd-sof-dbg.conf")
+        else:
+            rmfile("/etc/modprobe.d/snd-sof-dbg.conf")
+        print_status("Done, please reboot for changes to take effect.")
+        exit()
+
+    print_status("Installing SOF")
+
+    # Install sof firmware
+    if not path_exists("/lib/firmware/intel/sof"):
+        print_status("Installing SOF firmware")
+        install_package("sof-firmware", "firmware-sof-signed", "alsa-sof-firmware", "sof-firmware", "sof-firmware", "sof-firmware")
+
+    # Special tplg cases
+    # RPL devices load tplg with a different file name than ADL, despite being the exact same file as their ADL counterparts
+    # sof-bin currently doesn't include these symlinks, so we create them ourselves
+    if platform == "adl":
+        tplgs = ["cs35l41", "max98357a-rt5682-4ch", "max98357a-rt5682", "max98360a-cs42l42", "max98360a-nau8825", "max98360a-rt5682-2way", "max98360a-rt5682-4ch", "max98360a-rt5682", "max98373-nau8825", "max98390-rt5682", "max98390-ssp2-rt5682-ssp0", "nau8825", "rt1019-nau8825", "rt1019-rt5682", "rt5682", "rt711", "sdw-max98373-rt5682"]
+        for tplg in tplgs:
+            tplg_path="/lib/firmware/intel/sof-tplg"
+            if path_exists(f"{tplg_path}/sof-adl-{tplg}.tplg"):
+                bash(f"ln -sf {tplg_path}/sof-adl-{tplg}.tplg {tplg_path}/sof-rpl-{tplg}.tplg")
+            if path_exists(f"{tplg_path}/sof-adl-{tplg}.tplg.xz"):
+                bash(f"ln -sf {tplg_path}/sof-adl-{tplg}.tplg.xz {tplg_path}/sof-rpl-{tplg}.tplg.xz")
+    # JSL needs tplg build from upstream which have not been shipped in distros yet
+    cpdir("conf/sof/tplg", "/lib/firmware/intel/sof-tplg")
+    # sof-adl-max98360a-cs42l42.tplg is symlinked to sof-adl-max98360a-rt5682.tplg in ChromeOS
+    tplg_file1="/lib/firmware/intel/sof-tplg/sof-adl-max98360a-rt5682.tplg"
+    tplg_file2="/lib/firmware/intel/sof-tplg/sof-adl-max98360a-cs42l42.tplg"
+    if path_exists(f"{tplg_file1}"):
+        bash(f"ln -sf {tplg_file1} {tplg_file2}")
+    if path_exists(f"{tplg_file1}.xz"):
+        bash(f"ln -sf {tplg_file1}.xz {tplg_file2}.xz")
+
+
+def hifi2_audio():
+    if args.debug:
+        print_status(f"{args.debug} SOF debugging")
+        if args.debug == "Enabling":
+            cpfile(f"conf/sof/hifi2-sof-dbg.conf", "/etc/modprobe.d/hifi2-sof-dbg.conf")
+        else:
+            rmfile("/etc/modprobe.d/hifi2-sof-dbg.conf")
+        print_status("Done, please reboot for changes to take effect.")
+        exit()
+
+    print_status("Forcing SOF driver in debug mode")
+    if not path_exists("/lib/firmware/intel/sof"):
+        install_package("sof-firmware", "firmware-sof-signed", "alsa-sof-firmware", "sof-firmware", "sof-firmware", "sof-firmware")
+    cpfile("conf/sof/hifi2-sof.conf", "/etc/modprobe.d/hifi2-sof.conf")
+
+
+def amd_audio(platform):
+    # Install sof firmware and modprobe config on mendocino
+    if platform == "mendocino":
+        print_status("Installing SOF firmware")
+        mkdir("/lib/firmware/amd/sof/community", create_parents=True)
+        mkdir("/lib/firmware/amd/sof-tplg", create_parents=True)
+        cpdir("conf/amd-sof/fw", "/lib/firmware/amd/sof/community")
+        cpdir("conf/amd-sof/tplg", "/lib/firmware/amd/sof-tplg")
+    elif platform == "stoney":
+        print_warning("WARNING: Your audio will not work unless you install a custom kernel")
+        print_warning("You can get a prebuilt kernel from https://nightly.link/chrultrabook/stoney-kernel/workflows/build/main/stoney-kernel.zip")
+
+
+if __name__ == "__main__":
+    args = process_args()
+
+    # Restart script as root
+    if os.geteuid() != 0:
+        # make the two people that use doas happy
+        if path_exists("/usr/bin/doas"):
+            doas_args = ['doas', sys.executable] + sys.argv + [os.environ]
+            os.execlpe('doas', *doas_args)
+        # other 99 percent of linux users
+        sudo_args = ['sudo', sys.executable] + sys.argv + [os.environ]
+        os.execlpe('sudo', *sudo_args)
+
+    # Important message
+    print_warning("WARNING: You may run into audio issues, even after running this script. Please report any issues on github.")
+
+    # Prompt debian users to install a custom kernel
+    with open("/etc/os-release", "r") as file:
+        distro = file.read()
+    if (distro.__contains__("VERSION_CODENAME=bookworm") or distro.__contains__("DEBIAN_CODENAME=bookworm")) and\
+    "chrultrabook" not in sp.check_output("uname -r", shell=True, text=True).strip():
+        print_status("NOTE: Most devices need a custom kernel for functional audio on Debian and distros based on Debian like LMDE")
+        if input("Would you like the script to automatically install this kernel? [Y/n] ").lower() != "n":
+            install_deb_kernel()
+
+    # Some distros (Solus) don't have /etc/modprobe.d/ for some reason
+    mkdir("/etc/modprobe.d", create_parents=True)
+
+    # platform specific configuration
+    board = get_board()
+    match_platform(board)
+
+    # UCM
+    install_ucm()
+
+    # Install wireplumber config to increase headroom
+    # fixes instability and crashes on various devices
+    if path_exists("/usr/bin/wireplumber"):
+      print_status("Increasing alsa headroom (fixes instability)")
+
+      # This is needed since newer wireplumber versions 0.5+ use a different configuration format
+      if "0.4" in sp.check_output("wireplumber -v", shell=True, text=True).strip():
+          mkdir("/etc/wireplumber/main.lua.d/", create_parents=True)
+          cpfile("conf/common/51-increase-headroom.lua", "/etc/wireplumber/main.lua.d/51-increase-headroom.lua")
+      else:
+         mkdir("/etc/wireplumber/wireplumber.conf.d/", create_parents=True)
+         cpfile("conf/common/51-increase-headroom.conf", "/etc/wireplumber/wireplumber.conf.d/51-increase-headroom.conf")
+         
+
+    # ubuntu moment :skull:
+    if distro.lower().__contains__("ubuntu_codename") and not distro.lower().__contains__("pop"):
+        ubuntu()
+
+    print_header("Audio installed successfully! Reboot to finish setup.")
